@@ -105,6 +105,38 @@ def _get_client() -> genai.Client:
     return genai.Client(api_key=api_key)
 
 
+def expand_query_for_search(user_question: str, thread_context: str | None = None) -> str:
+    """
+    ユーザーの質問が短い・抽象的だとコンテキスト不足になりがちなため、
+    Gemini で推論して必要そうな情報を付け加えた検索向けの質問に拡張する。
+    thread_context がある場合はスレッド内の会話を考慮する。
+    出力は質問と同じ言語で、検索クエリとして使うのに適した形にする。
+    """
+    client = _get_client()
+    context_block = ""
+    if thread_context and thread_context.strip():
+        context_block = f"""Previous messages in this thread (for context):
+{thread_context.strip()}
+
+Use this to better understand what the user is asking. Now expand the following question.
+
+"""
+    prompt = f"""You are helping to improve a search query for Google Cloud documentation.
+The user asked a short or vague question. Expand it into a more specific query by adding inferred context so that document search can find relevant pages. For example:
+- If they ask about "制限" (limits), add "Google Cloud" or the service name if obvious from context.
+- If they ask about a feature without naming the product, add the likely product or service name.
+- Keep the expanded query concise (one or two sentences, or a few keywords). Do not answer the question yourself.
+Output only the expanded query in the same language as the user, no explanation or quotation marks.
+
+{context_block}User question:
+{user_question}
+
+Expanded query:"""
+    response = client.models.generate_content(model=GEMINI_MODEL, contents=prompt)
+    out = (response.text or "").strip().strip("\"'")
+    return out if out else user_question
+
+
 def translate_to_english(user_question: str) -> str:
     """
     Translate the user's question to English for document search.
@@ -120,30 +152,96 @@ User question:
 
 English search query:"""
     response = client.models.generate_content(model=GEMINI_MODEL, contents=prompt)
-    out = (response.text or "").strip().strip('"\'')
+    out = (response.text or "").strip().strip("\"'")
     return out if out else user_question
+
+
+def format_query_for_search_documents(english_query: str) -> str:
+    """
+    search_documents がヒットしやすい形にクエリを整形する。
+    長い文や説明文は短いキーワード列にし、製品名・サービス名とトピックを明確にする。
+    """
+    if not english_query or len(english_query.strip()) < 50:
+        return english_query.strip()
+    client = _get_client()
+    prompt = f"""Rewrite this as a short search query for a documentation search API (e.g. Google Cloud docs).
+Rules:
+- Output 3 to 8 key terms only, separated by spaces. No full sentences.
+- Include the product or service name (e.g. Cloud Storage, GCS, Compute Engine) and the main topic (e.g. limits, quotas, best practices).
+- Use English. Use terms that appear in official documentation (e.g. "bucket" not "container" for GCS).
+- Output nothing else: no explanation, no quotes, no punctuation at the end.
+
+Input:
+{english_query}
+
+Search query:"""
+    response = client.models.generate_content(model=GEMINI_MODEL, contents=prompt)
+    out = (response.text or "").strip().strip("\"'.,;")
+    return out if out else english_query.strip()
 
 
 def _format_references(context_docs: str) -> str:
     """
-    context_docs から「## 出典: documents/...」を抽出し、参照セクションの文字列を組み立てる。
-    documents/docs.cloud.google.com/... → https://cloud.google.com/... に変換する。
+    context_docs から「## 出典: ...」の行を抽出し、出典セクションの文字列を組み立てる。
+    documents/... は https URL に変換。すでに https:// の場合はそのまま。
     """
-    refs = re.findall(r"^## 出典:\s*(documents/[^\s\n]+)", context_docs, re.MULTILINE)
-    seen = set()
-    lines = []
-    for r in refs:
-        if r in seen:
+    seen: set[str] = set()
+    lines: list[str] = []
+    for line in context_docs.splitlines():
+        line = line.strip()
+        if not line.startswith("##") or "出典" not in line:
+            continue
+        # 「## 出典:」の後ろを取得（URL 内の : と区別するため正規表現で出典直後のコロンのみ区切り）
+        m = re.search(r"##\s*出典\s*:\s*(.+)", line)
+        if not m:
+            continue
+        r = m.group(1).strip()
+        if not r or r in seen:
             continue
         seen.add(r)
-        if r.startswith("documents/docs.cloud.google.com/"):
-            url = "https://cloud.google.com/" + r[len("documents/docs.cloud.google.com/") :]
-        else:
-            url = "https://" + r.replace("documents/", "", 1)
-        lines.append(f"- {url}")
+        if r.startswith("https://"):
+            lines.append(f"- {r}")
+        elif r.startswith("documents/"):
+            if r.startswith("documents/docs.cloud.google.com/"):
+                url = (
+                    "https://cloud.google.com/"
+                    + r[len("documents/docs.cloud.google.com/") :]
+                )
+            else:
+                url = "https://" + r.replace("documents/", "", 1)
+            lines.append(f"- {url}")
     if not lines:
         return ""
-    return "\n\n**参照**\n" + "\n".join(lines)
+    return "\n\n**出典**\n本回答は以下のドキュメントを参照しています。\n\n" + "\n".join(
+        lines
+    )
+
+
+def _strip_inline_links(text: str) -> str:
+    """回答内の [text](url) 形式のインラインリンクを削除し、リンクテキストのみ残す。出典は末尾一覧で示すため。"""
+    return re.sub(r"\[([^\]]*)\]\([^)]+\)", r"\1", text)
+
+
+def _normalize_line_breaks(text: str) -> str:
+    """
+    改行を整理する。
+    - 回答本文に含まれる「## 出典:」行は削除（出典は末尾でまとめて付与するため）。
+    - 連続する空行は最大2つに抑える。
+    - 句点の直後に番号付きステップ（1. 2. など）が続く場合は、その前に改行2つを入れる。
+    """
+    lines = text.splitlines()
+    out: list[str] = []
+    for line in lines:
+        stripped = line.strip()
+        if stripped.startswith("##") and "出典" in stripped:
+            continue
+        out.append(line)
+    text = "\n".join(out)
+    # 句点の直後で「数字. 」（ステップ）が始まる箇所の前に改行を入れる
+    text = re.sub(r"([。.])\s*(\d+\.\s+)", r"\1\n\n\2", text)
+    # 連続空行を最大2つに
+    text = re.sub(r"\n{3,}", "\n\n", text)
+    return text.strip()
 
 
 def generate_answer(user_question: str, context_docs: str) -> str:
@@ -152,8 +250,22 @@ def generate_answer(user_question: str, context_docs: str) -> str:
     """
     client = _get_client()
     prompt = f"""You are a Google Cloud documentation expert. Answer the user's question using only the context documents below.
-- If the information is not in the context, say "ドキュメントに記載がありません。" (or the equivalent in the answer language). Do not guess.
+- If the information is not in the context, say "関連するドキュメントが見つかりませんでした｡" (or the equivalent in the answer language). Do not guess.
 - Respond in the same language as the user's question (e.g. if the question is in Japanese, answer in Japanese; if in English, answer in English).
+- Do NOT include markdown links [text](URL) or inline URLs in the answer body. Reference links will be listed at the end of the response as 出典.
+
+**長さ（必ず守ること）:**
+- 回答は簡潔に。Slack で読みやすい長さに抑え、要点・手順の骨子に絞る。
+- 重複説明や「〜することもできます」などの補足は最小限に。必要な場合のみ1文で補足する。
+
+**太字・記号（必ず守ること）:**
+- 太字は「見出し」だけに使う。見出しとは番号付きの大見出し（1. 〇〇、2. △△）の行のみ。サブ項目（・〇〇:）や本文中の語句は太字にしない。
+- 番号付きの見出しの先頭には ■ を付ける。例: ■ 1. クラスタのセキュリティを強化する
+- 箇条書き（サブ項目）にはアスタリスク * を使わず、・ または • を使う。
+
+**レイアウト・セクション（必ず守ること）:**
+- 手順は番号付きリストで書く。各メインステップの前には空行（改行2つ）を入れ、ステップ同士を明確に分ける。
+- 各番号項目の中では、サブポイントごとに改行し、必要に応じて空行を1行入れて区切る。2〜3文ごとに改行を挟む。行頭に余白（インデント）を付けない。すべての行は左揃えで書く。
 
 ## User question:
 {user_question}
@@ -164,9 +276,11 @@ def generate_answer(user_question: str, context_docs: str) -> str:
 ## Answer:"""
     response = client.models.generate_content(model=GEMINI_MODEL, contents=prompt)
     raw = response.text if response.text else "(回答を生成できませんでした)"
-    text = _normalize_symbols(raw)
+    text = _strip_inline_links(raw)
+    text = _normalize_line_breaks(text)
+    text = _normalize_symbols(text)
     text = _ensure_halfwidth_spaces(text)
     refs = _format_references(context_docs)
-    if refs and refs not in text:
+    if refs:
         text = text.rstrip() + "\n\n" + refs
     return text

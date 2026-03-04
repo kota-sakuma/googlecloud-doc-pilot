@@ -74,8 +74,33 @@ async def fetch_googlecloud_doc(query: str) -> str:
     if not results:
         return f"# 検索: {query}\n\n該当するドキュメントは見つかりませんでした｡"
 
-    # 2. このエンドポイントは search_documents のみ公開しており get_document / batch_get_documents は 404 のため、検索スニペットで組み立てる
+    # 2. parent を重複除いて最大 20 件取得し、get_documents で全文を取得（ツール名は get_documents、引数は names 配列）
+    parents = list(dict.fromkeys(r.get("parent") for r in results if r.get("parent")))[
+        :MAX_DOCS_TO_FETCH
+    ]
     parts = [f"# 検索: {query}\n"]
+
+    if parents:
+        try:
+            get_result = await _call_tool(
+                "get_documents",
+                arguments={"names": parents},
+                api_key=api_key,
+            )
+            documents = get_result.get("documents") or []
+            for doc in documents:
+                uri = doc.get("uri", "")
+                content = doc.get("content", "")
+                if uri:
+                    parts.append(f"## 出典: {uri}\n\n{content}\n")
+                else:
+                    parts.append(f"## 出典: {doc.get('name', '')}\n\n{content}\n")
+            if documents:
+                return "\n".join(parts)
+        except Exception:
+            pass
+
+    # get_documents が使えない、または結果が空の場合は検索スニペットで組み立てる
     for r in results[:MAX_DOCS_TO_FETCH]:
         parent = r.get("parent", "")
         content = r.get("content", "")
