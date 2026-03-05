@@ -224,6 +224,50 @@ def _strip_inline_links(text: str) -> str:
     return re.sub(r"\[([^\]]*)\]\([^)]+\)", r"\1", text)
 
 
+# コマンド・環境変数設定行とみなしてバッククォートで囲むパターン（行頭が $ / export / set VAR= / gcloud 等）
+_COMMAND_LINE_RE = re.compile(
+    r"^(?:\s*)(?:\$\s+)?(?:export\s+\w+|set\s+\w+=|gcloud\s+|gsutil\s+|bq\s+|kubectl\s+|[A-Za-z_][A-Za-z0-9_]*\s*=\s*[\"'].*[\"'])(.*)$",
+    re.MULTILINE,
+)
+
+
+def _wrap_bare_command_lines(text: str) -> str:
+    """
+    バッククォートで囲まれていないコマンド・環境変数行を `...` で囲む。
+    すでに ` または ``` で囲まれている行は触らない。
+    """
+    lines = text.split("\n")
+    result: list[str] = []
+    in_fenced = False
+    fenced_char = ""
+    for line in lines:
+        stripped = line.strip()
+        # 既に ``` ブロック内ならそのまま
+        if stripped.startswith("```"):
+            in_fenced = not in_fenced
+            fenced_char = "```" if in_fenced else ""
+            result.append(line)
+            continue
+        if in_fenced:
+            result.append(line)
+            continue
+        # 既に ` で始まる行（インラインコードのみの行）はそのまま
+        if stripped.startswith("`") and stripped.endswith("`") and "`" in stripped[1:-1]:
+            result.append(line)
+            continue
+        if re.match(r"^`[^`]+`\s*$", stripped):
+            result.append(line)
+            continue
+        # コマンド風の行を検出して囲む（export VAR=, set VAR=, $ command, gcloud ... 等）
+        if _COMMAND_LINE_RE.match(line) and "`" not in line:
+            # 行頭の空白を保持して、内容を ` で囲む
+            leading = line[: len(line) - len(line.lstrip())]
+            result.append(leading + "`" + line.strip() + "`")
+        else:
+            result.append(line)
+    return "\n".join(result)
+
+
 def _normalize_line_breaks(text: str) -> str:
     """
     改行を整理する。
@@ -300,6 +344,10 @@ def generate_answer(user_question: str, context_docs: str) -> str:
 - 番号付きの見出しの先頭には ■ を付ける。例: ■ 1. クラスタのセキュリティを強化する
 - 箇条書き（サブ項目）にはアスタリスク * を使わず、・ または • を使う。
 
+**コード・コマンド（必ず守ること）:**
+- コマンド、環境変数の設定例、パス、コード片は必ずバッククォートで囲む。例: `export PUBSUB_EMULATOR_HOST=[::1]:8432` または複数行は ``` で囲む。
+- Linux/macOS と Windows で異なるコマンドがある場合は「Linux / macOS:」「Windows:」のようにラベルを付けた上で、それぞれのコマンドを `...` で囲む。
+
 **レイアウト・セクション（必ず守ること）:**
 - 手順は番号付きリストで書く。各メインステップ（■ 1. 〜、■ 2. 〜）の**前には必ず空行を1行入れる**。ステップ同士がつながらないようにする。
 - 番号は連続させる（1, 2, 3...）。サブ手順は「・」や「Linux / macOS:」「Windows:」などで示し、大見出しの番号を重複させない。
@@ -315,6 +363,7 @@ def generate_answer(user_question: str, context_docs: str) -> str:
     response = client.models.generate_content(model=GEMINI_MODEL, contents=prompt)
     raw = response.text if response.text else "(回答を生成できませんでした)"
     text = _strip_inline_links(raw)
+    text = _wrap_bare_command_lines(text)
     text = _normalize_line_breaks(text)
     text = _normalize_symbols(text)
     text = _ensure_halfwidth_spaces(text)

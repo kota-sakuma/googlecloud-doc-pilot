@@ -36,9 +36,20 @@ def _markdown_to_slack_mrkdwn(text: str) -> str:
     - **bold** → *bold*（Slack は * の直後に空白があると太字にならないので詰める）
     - ## 見出し → *見出し*
     - 単独の *（太字になっていない）は削除またはビュレットに変換して表示崩れを防ぐ
+    - バッククォート `...` および ``` ブロック内は変換しない（コードとしてそのまま表示）
     """
     if not text:
         return text
+    # バッククォートで囲まれた部分は保護してから変換する（コード内の ** を太字にしない）
+    placeholders: list[str] = []
+    def save_chunk(m: re.Match[str]) -> str:
+        placeholders.append(m.group(0))
+        return f"\x00P{len(placeholders)-1}\x00"
+
+    # ``` ブロックを保護
+    text = re.sub(r"```[\s\S]*?```", save_chunk, text)
+    # `...` インラインコードを保護
+    text = re.sub(r"`[^`]+`", save_chunk, text)
     # **text** → *text*（Slack の太字）
     text = re.sub(r"\*\*(.+?)\*\*", r"*\1*", text)
     # * と語の間のスペースを除去（* Cloud Storage * → *Cloud Storage* でないと Slack で太字にならない）
@@ -63,6 +74,9 @@ def _markdown_to_slack_mrkdwn(text: str) -> str:
     text = "\n".join(out)
     # 既に • が含まれている箇所も ・ に統一（サイズ差をなくす）
     text = text.replace("• ", "・ ").replace("•", "・")
+    # 保護したコードブロックを復元
+    for i, ph in enumerate(placeholders):
+        text = text.replace(f"\x00P{i}\x00", ph)
     return text
 
 
@@ -104,47 +118,48 @@ def _ensure_heading_marker(text: str) -> str:
 def _answer_to_slack_blocks(answer: str) -> list[dict] | None:
     """
     回答テキストを Slack Block Kit の blocks に変換する。
-    - 本文を「出典」前と「出典」以降に分割
+    - 本文を「出典」前と「出典」以降に分割（mrkdwn 変換前に出典を分離すること）
     - 本文を番号付きステップ（1. 2. ...）で分割し、各ステップを section、区切りに divider を挿入
     - 出典はリンク付き section で末尾に追加
     - パースに失敗した場合や blocks が空の場合は None を返し、呼び出し側で通常の say(text=) にフォールバックする
     """
     if not answer or not answer.strip():
         return None
-    text = _markdown_to_slack_mrkdwn(answer)
 
-    # 出典セクションを分離（**出典** または 「本回答は以下の」 から末尾まで）
+    # 出典セクションを「変換前」の本文から分離（**出典** は mrkdwn 変換で *出典* になるため、先に分ける）
     ref_marker = "**出典**"
     ref_marker_alt = "本回答は以下のドキュメントを参照しています。"
-    body = text
+    body_raw = answer
     refs_text = ""
-    if ref_marker in text:
-        i = text.find(ref_marker)
-        body = text[:i].rstrip()
-        refs_text = text[i:]
-    elif ref_marker_alt in text:
-        i = text.find(ref_marker_alt)
-        body = text[:i].rstrip()
-        refs_text = text[i:]
+    if ref_marker in answer:
+        i = answer.find(ref_marker)
+        body_raw = answer[:i].rstrip()
+        refs_text = answer[i:]
+    elif ref_marker_alt in answer:
+        i = answer.find(ref_marker_alt)
+        body_raw = answer[:i].rstrip()
+        refs_text = answer[i:]
+
+    text = _markdown_to_slack_mrkdwn(body_raw)
 
     blocks: list[dict] = []
 
-    # 本文をステップに分割。まず「改行 + (■)? 数字. 」の直前に区切る
-    split_by_step = re.split(r"\n(?=■\s*\d+\.\s|\d+\.\s)", body, maxsplit=1)
-    if len(split_by_step) == 2:
-        intro = split_by_step[0].strip()
-        rest = split_by_step[1]
-    else:
-        intro = ""
-        rest = body
-    # 候補の残りを「空行 + (■)? 数字. 」で区切って各ステップに
-    step_pat = re.compile(r"\n\n(?=■\s*\d+\.\s|\d+\.\s)", re.MULTILINE)
-    parts = step_pat.split(rest)
-    steps = [p.strip() for p in parts if p.strip()]
-    # 先頭が番号（または ■ 番号）で始まっていない塊は intro に含める
-    if steps and not re.match(r"^(■\s*)?\d+\.\s", steps[0]):
-        intro = (intro + "\n\n" + steps[0]).strip() if intro else steps[0]
-        steps = steps[1:]
+    # 本文をステップに分割。1改行以上 + 行頭の空白を許容して「(■)? 数字. 」の直前に区切る
+    step_pat = re.compile(r"\n+(?=\s*(?:■\s*)?\d+\.\s)", re.MULTILINE)
+    parts = step_pat.split(text)
+    intro = ""
+    steps: list[str] = []
+    for i, p in enumerate(parts):
+        s = p.strip()
+        if not s:
+            continue
+        if re.match(r"^(■\s*)?\d+\.\s", s):
+            steps.append(s)
+        else:
+            if not steps:
+                intro = (intro + "\n\n" + s).strip() if intro else s
+            else:
+                steps[-1] = steps[-1] + "\n\n" + s
 
     def _add_section(t: str, is_step: bool = False) -> None:
         t = _normalize_line_start(t.strip())
