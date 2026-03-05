@@ -6,6 +6,8 @@ import asyncio
 import logging
 import os
 import re
+import threading
+from http.server import HTTPServer, BaseHTTPRequestHandler
 
 from dotenv import load_dotenv
 from slack_bolt import App
@@ -328,13 +330,39 @@ def handle_message(message, say):
         say(text=":warning: 回答の生成中にエラーが発生しました。しばらくしてからもう一度お試しください。")
 
 
+def _run_health_server(port: int) -> None:
+    """Cloud Run 向け: PORT で HTTP をリッスンし、ヘルスチェックに 200 を返す。"""
+
+    class HealthHandler(BaseHTTPRequestHandler):
+        def do_GET(self):
+            self.send_response(200)
+            self.send_header("Content-Type", "text/plain; charset=utf-8")
+            self.end_headers()
+            self.wfile.write(b"ok")
+
+        def log_message(self, format, *args):
+            logger.debug("%s - %s", self.address_string(), format % args)
+
+    server = HTTPServer(("", port), HealthHandler)
+    logger.info("Health check server listening on port %s", port)
+    server.serve_forever()
+
+
 def run():
     """
     Run the application with Socket Mode.
+    Cloud Run で動かす場合は PORT でヘルスチェック用 HTTP サーバーも起動する。
     """
     app_token = os.getenv("SLACK_APP_TOKEN")
     if not app_token:
         raise ValueError("SLACK_APP_TOKEN is not set")
+
+    port = int(os.getenv("PORT", "0"))
+    if port > 0:
+        t = threading.Thread(target=_run_health_server, args=(port,), daemon=True)
+        t.start()
+        logger.info("Started health check server on port %s (e.g. for Cloud Run)", port)
+
     handler = SocketModeHandler(app, app_token)
     handler.start()
     logger.info("Application started")
