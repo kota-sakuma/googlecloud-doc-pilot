@@ -272,17 +272,24 @@ def handle_app_mention(event, say, client, context):
     thread_ts = event.get("thread_ts") or event.get("ts")
     current_ts = event.get("ts", "")
     bot_user_id = getattr(context, "bot_user_id", None)
-    thread_context = _fetch_thread_context(client, channel, thread_ts, current_ts, bot_user_id) or None
-    answer = _build_answer(user_question, thread_context=thread_context)
-    blocks = _answer_to_slack_blocks(answer)
-    if blocks:
-        fallback = (answer.strip()[:200] + "…") if len(answer) > 200 else answer.strip()
-        _say_blocks_chunked(
-            say, blocks, fallback or "Google Cloud ドキュメントの回答",
-            thread_ts=thread_ts, unfurl_links=False, unfurl_media=False,
+    try:
+        thread_context = _fetch_thread_context(client, channel, thread_ts, current_ts, bot_user_id) or None
+        answer = _build_answer(user_question, thread_context=thread_context)
+        blocks = _answer_to_slack_blocks(answer)
+        if blocks:
+            fallback = (answer.strip()[:200] + "…") if len(answer) > 200 else answer.strip()
+            _say_blocks_chunked(
+                say, blocks, fallback or "Google Cloud ドキュメントの回答",
+                thread_ts=thread_ts, unfurl_links=False, unfurl_media=False,
+            )
+        else:
+            say(text=_markdown_to_slack_mrkdwn(answer), mrkdwn=True, thread_ts=thread_ts, unfurl_links=False, unfurl_media=False)
+    except Exception as e:
+        logger.exception("Error in app_mention handler: %s", e)
+        say(
+            text=":warning: 回答の生成中にエラーが発生しました。しばらくしてからもう一度お試しください。",
+            thread_ts=thread_ts,
         )
-    else:
-        say(text=_markdown_to_slack_mrkdwn(answer), mrkdwn=True, thread_ts=thread_ts, unfurl_links=False, unfurl_media=False)
 
 
 @app.message()
@@ -293,13 +300,17 @@ def handle_message(message, say):
     text = message.get("text", "").strip()
     if not text:
         return
-    answer = _build_answer(text)
-    blocks = _answer_to_slack_blocks(answer)
-    if blocks:
-        fallback = (answer.strip()[:200] + "…") if len(answer) > 200 else answer.strip()
-        _say_blocks_chunked(say, blocks, fallback or "Google Cloud ドキュメントの回答")
-    else:
-        say(text=_markdown_to_slack_mrkdwn(answer), mrkdwn=True)
+    try:
+        answer = _build_answer(text)
+        blocks = _answer_to_slack_blocks(answer)
+        if blocks:
+            fallback = (answer.strip()[:200] + "…") if len(answer) > 200 else answer.strip()
+            _say_blocks_chunked(say, blocks, fallback or "Google Cloud ドキュメントの回答")
+        else:
+            say(text=_markdown_to_slack_mrkdwn(answer), mrkdwn=True)
+    except Exception as e:
+        logger.exception("Error in message handler: %s", e)
+        say(text=":warning: 回答の生成中にエラーが発生しました。しばらくしてからもう一度お試しください。")
 
 
 def run():

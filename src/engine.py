@@ -105,7 +105,9 @@ def _get_client() -> genai.Client:
     return genai.Client(api_key=api_key)
 
 
-def expand_query_for_search(user_question: str, thread_context: str | None = None) -> str:
+def expand_query_for_search(
+    user_question: str, thread_context: str | None = None
+) -> str:
     """
     ユーザーの質問が短い・抽象的だとコンテキスト不足になりがちなため、
     Gemini で推論して必要そうな情報を付け加えた検索向けの質問に拡張する。
@@ -228,6 +230,7 @@ def _normalize_line_breaks(text: str) -> str:
     - 回答本文に含まれる「## 出典:」行は削除（出典は末尾でまとめて付与するため）。
     - 連続する空行は最大2つに抑える。
     - 句点の直後に番号付きステップ（1. 2. など）が続く場合は、その前に改行2つを入れる。
+    - 番号付き見出し（■ N. または N. ）の直前に空行が無い場合は空行1行を入れる。
     """
     lines = text.splitlines()
     out: list[str] = []
@@ -237,11 +240,45 @@ def _normalize_line_breaks(text: str) -> str:
             continue
         out.append(line)
     text = "\n".join(out)
-    # 句点の直後で「数字. 」（ステップ）が始まる箇所の前に改行を入れる
+    # 句点の直後に「数字. 」（ステップ）が始まる箇所の前に改行を入れる
     text = re.sub(r"([。.])\s*(\d+\.\s+)", r"\1\n\n\2", text)
+    # 番号付き見出しの直前に空行が無い場合は空行を1行入れる（単一改行のときだけ）
+    # キャプチャは (\s*) (■\s*)? (\d+\.\s+) の3つのみ
+    text = re.sub(
+        r"(?<!\n)\n(?!\n)(\s*)(■\s*)?(\d+\.\s+)",
+        r"\n\n\1\2\3",
+        text,
+    )
     # 連続空行を最大2つに
     text = re.sub(r"\n{3,}", "\n\n", text)
     return text.strip()
+
+
+# 番号付き見出しの行（■ 6. タイトル または 6. タイトル）にマッチ
+_SECTION_HEADING_RE = re.compile(r"^(\s*)(■\s*)?(\d+)(\.\s+)(.*)$", re.MULTILINE)
+
+
+def _fix_section_numbering(text: str) -> str:
+    """
+    番号付きセクション（■ 1. 〜 や 6. 〜）が逆行しないようにする。
+    直前の番号より小さいまたは同じ番号が出た場合は、直前+1 に置き換える。
+    """
+    last_num = 0
+
+    def repl(m: re.Match[str]) -> str:
+        nonlocal last_num
+        prefix = m.group(1)  # 行頭の空白
+        bullet = m.group(2) or ""  # ■ があれば
+        num_str = m.group(3)
+        dot_rest = m.group(4)  # ". "
+        rest = m.group(5)
+        num = int(num_str)
+        if num <= last_num:
+            num = last_num + 1
+        last_num = num
+        return f"{prefix}{bullet}{num}{dot_rest}{rest}"
+
+    return _SECTION_HEADING_RE.sub(repl, text)
 
 
 def generate_answer(user_question: str, context_docs: str) -> str:
@@ -264,7 +301,8 @@ def generate_answer(user_question: str, context_docs: str) -> str:
 - 箇条書き（サブ項目）にはアスタリスク * を使わず、・ または • を使う。
 
 **レイアウト・セクション（必ず守ること）:**
-- 手順は番号付きリストで書く。各メインステップの前には空行（改行2つ）を入れ、ステップ同士を明確に分ける。
+- 手順は番号付きリストで書く。各メインステップ（■ 1. 〜、■ 2. 〜）の**前には必ず空行を1行入れる**。ステップ同士がつながらないようにする。
+- 番号は連続させる（1, 2, 3...）。サブ手順は「・」や「Linux / macOS:」「Windows:」などで示し、大見出しの番号を重複させない。
 - 各番号項目の中では、サブポイントごとに改行し、必要に応じて空行を1行入れて区切る。2〜3文ごとに改行を挟む。行頭に余白（インデント）を付けない。すべての行は左揃えで書く。
 
 ## User question:
@@ -280,6 +318,7 @@ def generate_answer(user_question: str, context_docs: str) -> str:
     text = _normalize_line_breaks(text)
     text = _normalize_symbols(text)
     text = _ensure_halfwidth_spaces(text)
+    text = _fix_section_numbering(text)
     refs = _format_references(context_docs)
     if refs:
         text = text.rstrip() + "\n\n" + refs
