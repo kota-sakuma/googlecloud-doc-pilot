@@ -1,0 +1,9 @@
+# BuildKit を有効化しないと Dockerfile の --mount が使えず失敗する
+# 例: gcloud builds submit --config=cloudbuild.yaml --substitutions=_IMAGE_BASE=REGION-docker.pkg.dev/PROJECT/REPO/NAME,_TAG=0.1.0 .
+steps:
+  - name: 'gcr.io/cloud-builders/docker'
+    args: ['build', '-t', '${_IMAGE_BASE}:${_TAG}', '.']
+    env:
+      - 'DOCKER_BUILDKIT=1'
+images:
+  - '${_IMAGE_BASE}:${_TAG}'
